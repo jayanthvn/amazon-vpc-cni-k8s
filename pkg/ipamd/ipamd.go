@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"math"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -747,12 +748,7 @@ func (c *IPAMContext) tryAllocateENI() error {
 	resourcesToAllocate := c.GetENIResourcesToAllocate()
 	short, _, warmTargetDefined := c.datastoreTargetState()
 	if warmTargetDefined {
-		if !c.enableIpv4PrefixDelegation {
 			resourcesToAllocate = short
-		} else if c.enableIpv4PrefixDelegation {
-			resourcesToAllocate = 1
-			log.Infof("Update this once we have multiPD support")
-		}
 	}
 
 	err = c.awsClient.AllocIPAddresses(eni, resourcesToAllocate)
@@ -795,11 +791,18 @@ func (c *IPAMContext) tryAssignIPsOrPrefixes() (increasedPool bool, err error) {
 }
 
 func (c *IPAMContext) tryAssignIPs() (increasedPool bool, err error) {
+	// If WARM_IP_TARGET is set we only want to allocate up to that target
+ 	// to avoid overallocating and releasing
+	short, _, warmIPTargetDefined := c.datastoreTargetState() 
+ 	toAllocate := c.maxIPsPerENI
+ 	if warmIPTargetDefined {
+ 		toAllocate = short
+ 	}
 	eni := c.dataStore.GetENINeedsIP(c.maxIPsPerENI, c.useCustomNetworking)
 	if eni != nil && len(eni.AvailableIPv4Cidrs) < c.maxIPsPerENI {
 		currentNumberOfAllocatedIPs := len(eni.AvailableIPv4Cidrs)
 		// Try to allocate all available IPs for this ENI
-		err = c.awsClient.AllocIPAddresses(eni.ID, c.maxIPsPerENI-currentNumberOfAllocatedIPs)
+		err = c.awsClient.AllocIPAddresses(eni.ID, min((c.maxIPsPerENI-currentNumberOfAllocatedIPs), toAllocate))
 		if err != nil {
 			log.Warnf("failed to allocate all available IP addresses on ENI %s, err: %v", eni.ID, err)
 			// Try to just get one more IP
@@ -823,11 +826,27 @@ func (c *IPAMContext) tryAssignIPs() (increasedPool bool, err error) {
 }
 
 func (c *IPAMContext) tryAssignPrefixes() (increasedPool bool, err error) {
+	short, _, warmIPTargetDefined := c.datastoreTargetState()
+	//By default allocate 1 prefix at a time
+	toAllocate := 1
+	if warmIPTargetDefined {
+		toAllocate = max(toAllocate, short)
+	}
+
+	// /28 will consume 16 IPs so let's not allocate if not needed.
+	freePrefixesInStore := c.dataStore.GetFreePrefixes()
+	if toAllocate >= freePrefixesInStore {
+		log.Debugf("DataStore already has %d free prefixes so no need to assign more prefixes", freePrefixesInStore)
+		return true, nil
+	}
+
+	// Returns an ENI which has space for more prefixes to be attached, but this
+	// ENI might not suffice the WARM_IP_TARGET
 	eni := c.dataStore.GetENINeedsIP(c.maxPrefixesPerENI, c.useCustomNetworking)
 	if eni != nil {
 		currentNumberOfAllocatedPrefixes := len(eni.AvailableIPv4Cidrs)
 		log.Debugf("Adding prefix to ENI %s ", eni.ID)
-		err = c.awsClient.AllocIPAddresses(eni.ID, c.maxPrefixesPerENI-currentNumberOfAllocatedPrefixes)
+		err = c.awsClient.AllocIPAddresses(eni.ID, min((c.maxPrefixesPerENI-currentNumberOfAllocatedPrefixes), toAllocate))
 		if err != nil {
 			log.Warnf("failed to allocate all available IPv4 Prefixes on ENI %s, err: %v", eni.ID, err)
 			// Try to just get one more prefix
@@ -1023,9 +1042,8 @@ func (c *IPAMContext) shouldRemoveExtraENIs() bool {
 		// We need the +1 to make sure we are not going below the WARM_ENI_TARGET.
 		shouldRemoveExtra = available >= (c.warmENITarget+1)*c.maxIPsPerENI
 	} else if c.enableIpv4PrefixDelegation {
-		// All Ips are available so see if we need to remove some ENIs
 		_, maxIpsPerPrefix, _ := datastore.GetPrefixDelegationDefaults()
-		shouldRemoveExtra = available == (totalPrefix * maxIpsPerPrefix)
+		shouldRemoveExtra = available >= (c.warmPrefixTarget+1)*maxIpsPerPrefix
 		log.Debugf("Total available IPs %d and prefixes available %d", available, totalPrefix)
 	}
 	if shouldRemoveExtra {
@@ -1475,47 +1493,37 @@ func (c *IPAMContext) filterUnmanagedENIs(enis []awsutils.ENIMetadata) []awsutil
 }
 
 // datastoreTargetState determines the number of IPs `short` or `over` our WARM_IP_TARGET,
-// accounting for the MINIMUM_IP_TARGET without prefix delegation enabled.
-// With prefix delegation this function accounts for WARM_PREFIX_TARGET
+// accounting for the MINIMUM_IP_TARGET 
+// With prefix delegation this function determines the number of Prefixes `short` or `over` 
 func (c *IPAMContext) datastoreTargetState() (short int, over int, enabled bool) {
-	if c.warmIPTarget == noWarmIPTarget && c.minimumIPTarget == noMinimumIPTarget && !c.enableIpv4PrefixDelegation {
+
+	if c.warmIPTarget == noWarmIPTarget && c.minimumIPTarget == noMinimumIPTarget {
 		// there is no WARM_IP_TARGET defined and no MINIMUM_IP_TARGET, fallback to use all IP addresses on ENI
 		return 0, 0, false
 	}
-
-	if c.warmPrefixTarget == noWarmPrefixTarget && c.enableIpv4PrefixDelegation {
-		return 0, 0, false
-	}
-
-	total, assigned, totalPrefix := c.dataStore.GetStats()
+	
+	total, assigned, _ := c.dataStore.GetStats()
 	available := total - assigned
 
-	if !c.enableIpv4PrefixDelegation {
-		// short is greater than 0 when we have fewer available IPs than the warm IP target
-		short = max(c.warmIPTarget-available, 0)
+	// short is greater than 0 when we have fewer available IPs than the warm IP target
+	short = max(c.warmIPTarget-available, 0)
 
-		// short is greater than the warm IP target alone when we have fewer total IPs than the minimum target
-		short = max(short, c.minimumIPTarget-total)
+	// short is greater than the warm IP target alone when we have fewer total IPs than the minimum target
+	short = max(short, c.minimumIPTarget-total)
 
-		// over is the number of available IPs we have beyond the warm IP target
-		over = max(available-c.warmIPTarget, 0)
+	// over is the number of available IPs we have beyond the warm IP target
+	over = max(available-c.warmIPTarget, 0)
 
-		// over is less than the warm IP target alone if it would imply reducing total IPs below the minimum target
-		over = max(min(over, total-c.minimumIPTarget), 0)
+	// over is less than the warm IP target alone if it would imply reducing total IPs below the minimum target
+	over = max(min(over, total-c.minimumIPTarget), 0)
 
-		log.Debugf("Current warm IP stats: target: %d, total: %d, assigned: %d, available: %d, short: %d, over %d", c.warmIPTarget, total, assigned, available, short, over)
-	} else {
-		//With prefix delegation short/over will be in terms of prefixes
-		//TODO - See if this can be optimized. If there are holes in the subnet, can it be considered as 1 prefix,
-		//for instance prefix 1 -> used [8] free [8], prefix 2 -> used [8] free [8], available = 16, so if warm prefix target is 2, then we shouldnt allocate
-		//one more prefix.
-		freePrefixes := c.dataStore.GetFreePrefixes()
-
-		short = max(c.warmPrefixTarget-freePrefixes, 0)
-		over = max(freePrefixes-c.warmPrefixTarget, 0)
-
-		log.Debugf("Current warm prefix IP stats: target: %d, total: %d, assigned: %d, available: %d, short: %d, over %d, total prefixes: %d", c.warmPrefixTarget, total, assigned, available, short, over, totalPrefix)
+	if c.enableIpv4PrefixDelegation {
+		_, numIPsPerPrefix, _ := datastore.GetPrefixDelegationDefaults()
+		short = int(math.Ceil(float64(short)/float64(numIPsPerPrefix)))
+		over = int(math.Ceil(float64(over)/float64(numIPsPerPrefix)))
 	}
+	log.Debugf("Current warm IP stats: target: %d, total: %d, assigned: %d, available: %d, short: %d, over %d", c.warmIPTarget, total, assigned, available, short, over)
+	
 	return short, over, true
 }
 
@@ -1710,7 +1718,11 @@ func (c *IPAMContext) GetIPv4Limit() (int, int, error) {
 	} else if c.enableIpv4PrefixDelegation {
 		//Single PD - allocate one prefix per ENI and new add will be new ENI + prefix
 		//Multi - allocate one prefix per ENI and new add will be new prefix or new ENI + prefix
-		maxPrefixesPerENI, maxIpsPerPrefix, _ = datastore.GetPrefixDelegationDefaults()
+		_, maxIpsPerPrefix, _ = datastore.GetPrefixDelegationDefaults()
+		maxPrefixesPerENI, err = c.awsClient.GetENIIPv4Limit()
+		if err != nil {
+			return 0, 0, err
+		}	
 		maxIPsPerENI = maxPrefixesPerENI * maxIpsPerPrefix
 		log.Debugf("max prefix %d max ips %d", maxPrefixesPerENI, maxIPsPerENI)
 	}
@@ -1724,8 +1736,8 @@ func (c *IPAMContext) isDatastorePoolTooLow() bool {
 	}
 
 	total, used, _ := c.dataStore.GetStats()
-
 	available := total - used
+
 	if !c.enableIpv4PrefixDelegation {
 		poolTooLow := available < c.maxIPsPerENI*c.warmENITarget || (c.warmENITarget == 0 && available == 0)
 		if poolTooLow {
@@ -1749,7 +1761,18 @@ func (c *IPAMContext) isDatastorePoolTooHigh() bool {
 	if warmTargetDefined {
 		return over > 0
 	}
+	total, used, _ := c.dataStore.GetStats()
+	available := total - used
 
-	// We only ever report the pool being too high if WARM_IP_TARGET or WARM_PREFIX_TARGET is set
+	if c.enableIpv4PrefixDelegation {
+		_, maxIpsPerPrefix, _ := datastore.GetPrefixDelegationDefaults()
+		poolTooHigh := available > maxIpsPerPrefix*c.warmPrefixTarget
+		if poolTooHigh {
+			logPoolStats(total, used, c.maxIPsPerENI, c.enableIpv4PrefixDelegation)
+			log.Debugf("Available IP pool is high: available (%d) > Warm prefix target (%d) * maxIpsPerPrefix (%d) let's try to free unused prefixes", available, c.warmPrefixTarget, maxIpsPerPrefix)
+		}
+		return poolTooHigh	
+	}
+	// SIP mode, We only ever report the pool being too high if WARM_IP_TARGET is set
 	return false
 }
